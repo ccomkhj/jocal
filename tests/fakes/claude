@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Fake Claude Code: `claude --version` prints FAKE_CLAUDE_VERSION (default 2.1.302) the way Claude Code does.
+Otherwise it records its argv, env, pid and the contents of the files given to --settings and --mcp-config to
+$FAKE_RECORD/claude.json. In print mode (-p/--print) it writes the stderr line the real one prints for a model id it
+doesn't know, then FAKE_CLAUDE_STDERR if set; combined short flags with p in them (-pc) are print mode too. With FAKE_CLAUDE_WAIT=<path> it stays running until that file exists."""
+import json, os, re, sys, time
+from pathlib import Path
+
+if sys.argv[1:] == ["--version"]:
+    sys.exit(print(os.environ.get("FAKE_CLAUDE_VERSION", "2.1.302"), "(Claude Code)"))
+argv = sys.argv[1:]
+files = {flag: Path(argv[argv.index(flag) + 1]).read_text() for flag in ("--settings", "--mcp-config") if flag in argv}
+record = {"argv": argv, "env": dict(os.environ), "pid": os.getpid(), "files": files}
+(Path(os.environ["FAKE_RECORD"]) / "claude.json").write_text(json.dumps(record))
+if any(a == "--print" or re.fullmatch(r"-[A-Za-z]*p[A-Za-z]*", a) for a in argv):
+    model = os.environ.get("ANTHROPIC_MODEL", "")
+    sys.stderr.write(f'[claude-code:unrecognized_model] {{"model":"{model}","query_source":"sdk"}}\n')
+    if os.environ.get("FAKE_CLAUDE_STDERR"):
+        sys.stderr.write(os.environ["FAKE_CLAUDE_STDERR"] + "\n")
+    print("an answer")
+wait = os.environ.get("FAKE_CLAUDE_WAIT")
+while wait and not Path(wait).exists():
+    time.sleep(0.05)
+sys.exit(int(os.environ.get("FAKE_CLAUDE_EXIT", "0")))

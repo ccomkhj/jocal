@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""Fake oMLX: appends its argv, the env jocal sets and the model settings it finds to $FAKE_RECORD/omlx.calls.
+`omlx serve --port P` serves /v1/models on P after FAKE_OMLX_DELAY seconds; with FAKE_OMLX_FAIL=1 it dies at once.
+With FAKE_OMLX_TERM_DELAY=<s> it keeps serving for that long after a TERM, as a busy oMLX does.
+`omlx --version` prints FAKE_OMLX_VERSION (default 0.7.0) and records nothing."""
+import json, os, signal, sys, threading, time
+from pathlib import Path
+
+if sys.argv[1:] == ["--version"]:
+    sys.exit(print(os.environ.get("FAKE_OMLX_VERSION", "0.7.0")))
+
+base = os.environ.get("OMLX_BASE_PATH")
+settings = Path(base) / "model_settings.json" if base else None
+record = {"argv": sys.argv[1:], "env": {k: os.environ.get(k) for k in ["OMLX_BASE_PATH", "HF_HUB_OFFLINE"]},
+          "settings": json.loads(settings.read_text()) if settings and settings.exists() else None}
+with open(Path(os.environ["FAKE_RECORD"]) / "omlx.calls", "a") as f:
+    f.write(json.dumps(record) + "\n")
+if sys.argv[1:2] == ["serve"]:
+    if os.environ.get("FAKE_OMLX_FAIL") == "1":
+        sys.exit("fake oMLX: failed to load")
+    time.sleep(float(os.environ.get("FAKE_OMLX_DELAY", "0")))
+    term_delay = float(os.environ.get("FAKE_OMLX_TERM_DELAY", "0"))
+    if term_delay:
+        signal.signal(signal.SIGTERM, lambda *_: threading.Timer(term_delay, os._exit, (0,)).start())
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import omlx_server
+    omlx_server.serve(int(sys.argv[sys.argv.index("--port") + 1]))

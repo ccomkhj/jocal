@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Fake Pi: records its argv, env, pid, stdin (with FAKE_PI_STDIN=1) and the files in PI_CODING_AGENT_DIR to
+$FAKE_RECORD/pi.json. With FAKE_PI_WAIT=<path> it stays running until that file exists. Then it exits.
+`pi --version` prints FAKE_PI_VERSION (default 1.3.0) and records nothing."""
+import json, os, sys, time
+from pathlib import Path
+
+if sys.argv[1:] == ["--version"]:
+    sys.exit(print(os.environ.get("FAKE_PI_VERSION", "1.3.0")))
+
+agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/nonexistent"))
+files = {p.name: p.read_text() for p in sorted(agent_dir.glob("*")) if p.is_file()}
+stdin = sys.stdin.read() if os.environ.get("FAKE_PI_STDIN") == "1" else None
+record = {"argv": sys.argv[1:], "env": dict(os.environ), "pid": os.getpid(), "stdin": stdin, "files": files}
+(Path(os.environ["FAKE_RECORD"]) / "pi.json").write_text(json.dumps(record))
+wait = os.environ.get("FAKE_PI_WAIT")
+while wait and not Path(wait).exists():
+    time.sleep(0.05)
+sys.exit(int(os.environ.get("FAKE_PI_EXIT", "0")))

@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Fake Hugging Face CLI: `hf download <repo> --revision <commit> --local-dir <dir>` records its argv and env to
+$FAKE_RECORD/hf.json and writes a config.json and a .cache dir into <dir>. FAKE_HF_EXIT makes it fail instead."""
+import json, os, sys
+from pathlib import Path
+
+argv = sys.argv[1:]
+(Path(os.environ["FAKE_RECORD"]) / "hf.json").write_text(json.dumps({"argv": argv, "env": dict(os.environ)}))
+if os.environ.get("FAKE_HF_EXIT"):
+    sys.exit(int(os.environ["FAKE_HF_EXIT"]))
+out = Path(argv[argv.index("--local-dir") + 1])
+(out / ".cache").mkdir(parents=True, exist_ok=True)
+(out / "config.json").write_text("{}")

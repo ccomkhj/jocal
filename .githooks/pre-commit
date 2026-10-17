@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# The repo's guardrail: lint the jocal scripts and run its hermetic suite before every commit.
+# Enable once per clone with `git config core.hooksPath .githooks`.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+scripts=(jocal install.sh tests/run .githooks/pre-commit)
+for f in "${scripts[@]}"; do bash -n "$f"; done
+command -v shellcheck >/dev/null || { echo "pre-commit: shellcheck missing (brew install shellcheck)" >&2; exit 1; }
+shellcheck -x "${scripts[@]}"
+tests/run -q

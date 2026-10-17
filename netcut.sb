@@ -1,0 +1,8 @@
+;; sandbox-exec profile that cuts the network: the harness may reach only loopback (the local runtime)
+;; and local unix sockets. Everything else outbound is denied and logged by the kernel as "deny(1) network-outbound".
+;;   sandbox-exec -f netcut.sb <harness command>
+(version 1)
+(allow default)
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-outbound (remote unix-socket))

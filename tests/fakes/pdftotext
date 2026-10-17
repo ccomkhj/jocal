@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Fake pdftotext: records its argv to $FAKE_RECORD/pdftotext.json and prints two form-feed-separated pages."""
+import json, os, sys
+from pathlib import Path
+
+(Path(os.environ["FAKE_RECORD"]) / "pdftotext.json").write_text(json.dumps(sys.argv[1:]))
+sys.stdout.write("text of PDF page one\fFILED BY 31 MARCH on page two\f")

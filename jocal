@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+# jocal: a local model as a per-session backend (README.md).
+#   jocal pi [--<model key>] [--explain] [pi args]          Pi on the local model
+#   jocal claude [--<model key>] [--explain] [claude args]  Claude Code on the local model
+#   jocal summarise [--<model key>] <file> "<question>"     answer from a document of any length (map-reduce)
+#   jocal up | down [--force]                               start or stop oMLX (sessions start it on demand)
+#   jocal status                                            runtime, leases, budgets, pin drift and warnings
+#   jocal doctor                                            what a first session needs, and how to install what's missing
+#   jocal fetch [--<model key>]                             download a model at its PIN_MODELS commit
+# Plain `pi` and `claude` stay on the cloud model.
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+CONFIG=${JOCAL_CONFIG:-$HOME/.config/jocal/jocal.conf}
+STATE=${JOCAL_STATE:-$HOME/.jocal}
+env_pi_bin=${PI_BIN:-} env_omlx_bin=${OMLX_BIN:-} env_claude_bin=${CLAUDE_BIN:-} env_hf_bin=${HF_BIN:-}   # an env override beats the config
+if [ ! -e "$CONFIG" ]; then
+  mkdir -p "$(dirname "$CONFIG")" && cp "$here/jocal.conf" "$CONFIG"
+  echo "jocal: wrote a starter config to $CONFIG" >&2
+fi
+# shellcheck source=SCRIPTDIR/jocal.conf
+source "$here/jocal.conf"   # the defaults, for any key the user's config leaves out
+# shellcheck source=/dev/null
+source "$CONFIG"
+if [ -n "$LOCAL_INSTRUCTIONS" ] && [ ! -e "$LOCAL_INSTRUCTIONS" ]; then
+  mkdir -p "$(dirname "$LOCAL_INSTRUCTIONS")" && cp "$here/LOCAL.md" "$LOCAL_INSTRUCTIONS"
+  echo "jocal: wrote starter local instructions to $LOCAL_INSTRUCTIONS" >&2
+fi
+URL=http://127.0.0.1:$PORT
+PI_BIN=${env_pi_bin:-${PI_BIN:-pi}}
+OMLX_BIN=${env_omlx_bin:-${OMLX_BIN:-omlx}}
+CLAUDE_BIN=${env_claude_bin:-${CLAUDE_BIN:-claude}}
+HF_BIN=${env_hf_bin:-${HF_BIN:-hf}}
+# The read budget in tokens (chars/4), the same for both harnesses: the window less the answer (MAX_OUT) and 8K for
+# the system prompt, instructions and the turns around the read; ~20K at CTX=32768.
+READ_CAP=$(( CTX - MAX_OUT - 8192 ))
+[ "$READ_CAP" -gt 0 ] || {
+  echo "jocal: CTX=$CTX leaves no read budget after MAX_OUT=$MAX_OUT and 8192 for the prompt; raise CTX or lower MAX_OUT in $CONFIG" >&2
+  exit 2
+}
+OMLX_HOME=$STATE/omlx   # oMLX's base path: its model settings, paged cache, log and jocal's pid file
+
+# A model key is a lowercase word with a digit in it (4b, 9b), so `--<key>` can't be taken for a harness flag.
+is_key() { [[ $1 =~ ^[a-z0-9][a-z0-9._-]*$ && $1 == *[0-9]* ]]; }
+
+# MODELS ("key=oMLX id ...") split once into KEYS and IDS; the first entry is the default.
+KEYS=() IDS=()
+set -f; for kv in $MODELS; do KEYS+=("${kv%%=*}") IDS+=("${kv#*=}"); done; set +f
+[ ${#KEYS[@]} -gt 0 ] || { echo "jocal: MODELS is empty in $CONFIG" >&2; exit 2; }
+for k in "${KEYS[@]}"; do
+  is_key "$k" || { echo "jocal: model key '$k' in MODELS needs to be lowercase with a digit, like 4b" >&2; exit 2; }
+done
+
+model_id() { local i; for i in "${!KEYS[@]}"; do [ "${KEYS[i]}" = "$1" ] && { echo "${IDS[i]}"; return; }; done; return 1; }
+
+# Leading jocal arguments set KEY; the rest are left in ARGS for the harness, unchanged.
+# A `--<word>` where the word could be a key is a model flag; anything else ends the jocal arguments.
+parse_args() {
+  KEY=${KEYS[0]} EXPLAIN=
+  while [ $# -gt 0 ]; do
+    if [ "$1" = --explain ]; then EXPLAIN=1
+    elif [[ $1 == --* ]] && is_key "${1#--}"; then
+      KEY=${1#--}
+      model_id "$KEY" >/dev/null || { echo "jocal: unknown model '--$KEY' (known keys: ${KEYS[*]})" >&2; exit 2; }
+    else break; fi
+    shift
+  done
+  ARGS=("$@")
+}
+
+# A session of harness $1 (pi or claude): its profile, banner, title and lease around the harness run.
+session() {
+  local harness=$1; shift
+  parse_args "$@"; set -- ${ARGS[@]+"${ARGS[@]}"}
+  local model; model=$(model_id "$KEY")
+  PROJECT_TOKENS=0 STDERR_DROP=
+  "${harness}_profile" "$model" "$@"
+  local banner="JOCAL · $harness · $KEY ($model) · oMLX $URL · prompts stay on this Mac" warning
+  if warning=$(project_warning); then banner+=" · $warning"; fi
+  [ -z "$EXPLAIN" ] || { echo "$banner"; echo; explain "$@"; return; }
+  lease_and_up "$harness $KEY"
+  # Marking goes to stderr, so `-p` output on stdout stays clean.
+  printf '\e]0;JOCAL · %s · %s\a' "$harness" "$KEY" >&2
+  printf '\e[7m %s \e[0m\n' "$banner" >&2
+  CHILD_STDERR=
+  if [ -n "$STDERR_DROP" ]; then   # through a filter that drops STDERR_DROP lines, waited for so its last lines print
+    local filter                   # before jocal exits
+    CHILD_STDERR=$STATE/stderr.$$
+    rm -f "$CHILD_STDERR"; mkfifo "$CHILD_STDERR"
+    grep -v --line-buffered -e "$STDERR_DROP" <"$CHILD_STDERR" >&2 &
+    filter=$!
+  fi
+  run_child env "${ENV[@]}" "${CMD[@]}" "$@"
+  [ -z "$STDERR_DROP" ] || wait "$filter" || true
+  exit "$STATUS"
+}
+
+# Map-reduce over a document (summarise.py), under a lease like a session; notes go to $STATE/summaries/.
+summarise() {
+  parse_args "$@"; set -- ${ARGS[@]+"${ARGS[@]}"}
+  if [ -n "$EXPLAIN" ] || [ $# -ne 2 ] || [ -z "$2" ]; then
+    echo 'usage: jocal summarise [--<model key>] <file> "<question>"' >&2; exit 2
+  fi
+  [ -f "$1" ] || { echo "jocal: no such file: $1" >&2; exit 2; }
+  [ -s "$1" ] || { echo "jocal: $1 is empty" >&2; exit 2; }
+  local model notes; model=$(model_id "$KEY")
+  notes=$STATE/summaries/$(date +%Y%m%d-%H%M%S)-$$-$(basename "$1").md
+  mkdir -p "$STATE/summaries"
+  lease_and_up "summarise $KEY"
+  CHILD_STDERR=
+  run_child python3 "$here/summarise.py" "$1" "$2" --url "$URL" --model "$model" --notes "$notes" --max-out "$MAX_OUT"
+  exit "$STATUS"
+}
+
+# Takes a lease for this jocal ($1 says what holds it, like `pi 4b`), sets the traps that release it, and starts the
+# runtime. The lease comes before `up`, so a session ending meanwhile doesn't stop the runtime under us.
+lease_and_up() {
+  mkdir -p "$STATE/leases"; echo "$1" >"$STATE/leases/$$"
+  CHILD=
+  trap session_end EXIT
+  trap 'end_child 129' HUP; trap 'end_child 130' INT; trap 'end_child 143' TERM
+  up
+}
+
+# Runs "$@" as the leased child, its stderr to CHILD_STDERR if set, and sets STATUS to its exit status.
+# A child, not exec, so the traps run; in the background, so a signal to the wrapper isn't held until it exits.
+# The explicit <&0 keeps the terminal as its stdin (a background job gets /dev/null otherwise). Its pid goes into
+# the lease too, so a child orphaned by a `kill -9` of jocal still holds the lease while it runs.
+run_child() {
+  if [ -z "$CHILD_STDERR" ]; then "$@" <&0 & else "$@" <&0 2>"$CHILD_STDERR" & fi
+  CHILD=$!
+  echo "$CHILD" >>"$STATE/leases/$$"
+  STATUS=0; wait "$CHILD" || STATUS=$?
+  CHILD=
+}
+
+# A signal to the wrapper ends the harness too, then the EXIT trap releases the lease.
+end_child() {
+  [ -z "$CHILD" ] || { kill -TERM "$CHILD" 2>/dev/null || true; wait "$CHILD" 2>/dev/null || true; }
+  exit "$1"
+}
+
+# Clears the title, releases the lease and, if it was the last one, stops the runtime (STOP_RUNTIME=last-exit).
+# The leases are checked and the runtime stopped under the runtime lock, so a session starting meanwhile either
+# shows up in that check or waits in `up` until the stop is over and starts a fresh oMLX.
+session_end() {
+  printf '\e]0;\a' >&2
+  rm -f "$STATE/leases/$$" "$STATE/stderr.$$"
+  if [ "$STOP_RUNTIME" = last-exit ] && [ -e "$OMLX_HOME/pid" ]; then
+    runtime_lock
+    [ -n "$(live_leases)" ] || stop_runtime 2>/dev/null || true
+    runtime_unlock
+  fi
+}
+
+runtime_up() { curl -sf -m 2 --noproxy '*' "$URL/v1/models" >/dev/null 2>&1; }
+
+# Starts oMLX unless PORT already answers, and waits for it to be ready. The check is made under the runtime lock,
+# so an oMLX that is being stopped isn't taken for up.
+up() {
+  mkdir -p "$OMLX_HOME/cache"
+  runtime_lock
+  if runtime_up; then runtime_unlock; return 0; fi
+  python3 - "$OMLX_HOME/model_settings.json" "$CTX" "${IDS[@]}" <<'PY'
+import json, sys
+path, ctx, models = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+off = {"max_context_window": ctx, "enable_thinking": False, "chat_template_kwargs": {"enable_thinking": False},
+       "forced_ct_kwargs": ["enable_thinking"]}   # forced: Claude Code asks for thinking otherwise
+json.dump({"version": 1, "models": {m: off for m in models}}, open(path, "w"), indent=1)
+PY
+  local log=$OMLX_HOME/serve.log
+  echo "jocal: starting oMLX on $URL (log: $log)" >&2
+  # Its own session, so the shell prints no job message and a Ctrl-C in the terminal never reaches it.
+  OMLX_BASE_PATH=$OMLX_HOME HF_HUB_OFFLINE=1 python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    "$OMLX_BIN" serve --model-dir "$MODELS_DIR" --port "$PORT" --no-hf-cache --memory-guard-gb "$RAM_GB" \
+    --paged-ssd-cache-dir "$OMLX_HOME/cache" --paged-ssd-cache-max-size "${PROMPT_CACHE_GB}GB" </dev/null >>"$log" 2>&1 &
+  local pid=$! i
+  echo "$pid" >"$OMLX_HOME/pid"
+  for ((i = 0; i < 300; i++)); do   # ~60 s
+    runtime_up && { runtime_unlock; return 0; }
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  stop_runtime >/dev/null 2>&1 || true
+  runtime_unlock
+  echo "jocal: oMLX did not come up on $URL; see $log" >&2
+  exit 1
+}
+
+# One start or stop at a time: a session starting meanwhile waits for this oMLX instead of starting a second one,
+# or for a stop to finish instead of taking the stopping oMLX for up. The lock holds its holder's pid, so one left
+# by a killed jocal is taken over, and a jocal that already holds it (a signal during `up`) takes it again at once.
+runtime_lock() {
+  local lock=$OMLX_HOME/lock holder
+  until (set -o noclobber; echo $$ >"$lock") 2>/dev/null; do
+    holder=$(cat "$lock" 2>/dev/null) || true
+    [ "$holder" != $$ ] || return 0
+    [ -z "$holder" ] || kill -0 "$holder" 2>/dev/null || rm -f "$lock"
+    sleep 0.2
+  done
+}
+
+runtime_unlock() { rm -f "$OMLX_HOME/lock"; }
+
+# `jocal down`: refuses while a session holds a lease, unless --force. Under the runtime lock, like a last exit.
+down() {
+  local live status=0
+  mkdir -p "$OMLX_HOME"
+  runtime_lock
+  live=$(live_leases)
+  if [ -n "$live" ] && [ "${1:-}" != --force ]; then
+    runtime_unlock
+    echo "jocal: sessions still use oMLX (lease pids: $(echo "$live" | tr '\n' ' ')); stop them, or use down --force" >&2
+    exit 1
+  fi
+  stop_runtime || status=$?
+  runtime_unlock
+  return "$status"
+}
+
+# Leases are $STATE/leases/<jocal pid>, one per running session: what holds it (`pi 4b`), then the harness's pid.
+# A lease is live while either pid is; prints the live leases' names and prunes the dead ones.
+live_leases() {
+  local f child
+  for f in "$STATE"/leases/*; do
+    [ -e "$f" ] || continue
+    child=$(sed -n 2p "$f" 2>/dev/null) || child=
+    if kill -0 "${f##*/}" 2>/dev/null || { [ -n "$child" ] && kill -0 "$child" 2>/dev/null; }; then echo "${f##*/}"
+    else rm -f "$f"; fi
+  done
+}
+
+# Stops the oMLX that jocal started (the one in the pid file); one started some other way is left alone.
+stop_runtime() {
+  local pid i
+  pid=$(cat "$OMLX_HOME/pid" 2>/dev/null) || { echo "jocal: no oMLX started by jocal" >&2; return 1; }
+  rm -f "$OMLX_HOME/pid"
+  if [[ $(ps -p "$pid" -o command= 2>/dev/null) != *omlx* ]]; then
+    echo "jocal: no oMLX started by jocal is running (pid $pid is gone; its pid file is removed)" >&2
+    return 1
+  fi
+  kill "$pid" 2>/dev/null || true
+  for ((i = 0; i < 40; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+  kill -9 "$pid" 2>/dev/null || true
+  echo "jocal: oMLX stopped" >&2
+}
+
+# A file's size in tokens, estimated as chars/4.
+tokens() { echo $(( $(wc -c <"$1") / 4 )); }
+
+# The instruction files the harness loads unchanged from the working directory and its parents, as Pi 1.3.0
+# finds them (the first of these names in each directory): sets PROJECT_FILES, PROJECT_NAMES and PROJECT_TOKENS.
+project_instructions() {
+  PROJECT_FILES=() PROJECT_NAMES='' PROJECT_TOKENS=0
+  local d=$PWD f name
+  while :; do
+    for name in AGENTS.override.md AGENTS.md AGENTS.MD CLAUDE.md CLAUDE.MD; do
+      f=${d%/}/$name
+      [ -f "$f" ] || continue
+      PROJECT_FILES=("$f" ${PROJECT_FILES[@]+"${PROJECT_FILES[@]}"})
+      PROJECT_NAMES=$name${PROJECT_NAMES:+ + $PROJECT_NAMES}
+      PROJECT_TOKENS=$(( PROJECT_TOKENS + $(tokens "$f") ))
+      break
+    done
+    [ "$d" != / ] || break
+    d=$(dirname "$d")
+  done
+}
+
+# The cold-reply warning for the project instruction files project_instructions found, used by the banner and
+# `status`; fails, printing nothing, while they are at or under PROJECT_WARN_TOKENS.
+PROJECT_WARN_TOKENS=1000
+project_warning() {
+  [ "$PROJECT_TOKENS" -gt "$PROJECT_WARN_TOKENS" ] || return 1
+  echo "$PROJECT_NAMES is ~$PROJECT_TOKENS tokens; each 1K adds 3-5 s to a cold first reply"
+}
+
+shell_quote() { if [[ $1 =~ ^[A-Za-z0-9_./:=,@%+-]+$ ]]; then printf '%s' "$1"; else printf '%q' "$1"; fi; }
+
+# Everything a session would set, from NOTES, ENV, CMD and FILES plus the passthrough args. Starts nothing.
+explain() {
+  printf '%s\n' ${NOTES[@]+"${NOTES[@]}"}
+  echo; echo "env:"; printf '  %s\n' "${ENV[@]}"
+  echo; echo "command:"; printf ' '; local a; for a in "${CMD[@]}" "$@"; do printf ' %s' "$(shell_quote "$a")"; done; echo
+  echo; echo "files:"
+  local f; for f in "${FILES[@]}"; do echo "--- $f"; cat "$f"; echo; done
+}
+
+# Writes $1, an `mcpServers` file holding only the MCP_SERVERS entries of MCP_FILE, each with the keys of $2 (JSON,
+# e.g. Pi's exposure) added; sets MCP_ALLOWED to their names and MCP_NOTE for --explain. A name missing from MCP_FILE,
+# or a server that is neither stdio nor a URL on this Mac, ends jocal before anything starts.
+mcp_allowlist() {
+  local name; MCP_ALLOWED=()
+  set -f; for name in $MCP_SERVERS; do MCP_ALLOWED+=("$name"); done; set +f
+  python3 - "$1" "${2:-}" "$MCP_FILE" ${MCP_ALLOWED[@]+"${MCP_ALLOWED[@]}"} <<'PY' || exit 2
+import json, re, sys
+from urllib.parse import urlsplit
+out, extra, mcp_file, names = sys.argv[1], json.loads(sys.argv[2] or "{}"), sys.argv[3], sys.argv[4:]
+def refuse(why):
+    sys.exit(f"jocal: {why}; no session started")
+servers = {}
+if names:
+    try:
+        known = json.load(open(mcp_file)).get("mcpServers", {})
+    except (OSError, ValueError) as e:
+        refuse(f"MCP_SERVERS names {', '.join(repr(n) for n in names)}, but MCP_FILE={mcp_file} can't be read ({e})")
+for name in names:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        refuse(f"MCP server '{name}' in MCP_SERVERS: a name has only letters, digits, _ and -")
+    if not isinstance(known.get(name), dict):
+        refuse(f"MCP server '{name}' in MCP_SERVERS is not in MCP_FILE={mcp_file}")
+    server = known[name]
+    if "url" in server:
+        try:
+            host = urlsplit(server["url"]).hostname
+        except ValueError:
+            host = None
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            refuse(f"MCP server '{name}' is at {server['url']}, not on this Mac (127.0.0.1, localhost or ::1)")
+    elif "command" not in server:
+        refuse(f"MCP server '{name}' in MCP_FILE={mcp_file} is neither stdio (command) nor a URL")
+    servers[name] = server | extra
+json.dump({"mcpServers": servers}, open(out, "w"), indent=1)
+PY
+  if [ ${#MCP_ALLOWED[@]} -eq 0 ]; then MCP_NOTE="MCP servers: none"
+  else MCP_NOTE="MCP servers: $(comma_list "${MCP_ALLOWED[@]}") (from $MCP_FILE)"; fi
+}
+
+# Sets NOTES, ENV, CMD, FILES and STDERR_DROP for a Claude Code session on $1 (an oMLX model id); $2... are the
+# passthrough args.
+claude_profile() {
+  # The settings file is per key: it carries the key's status line, and a session on another key runs alongside.
+  local model=$1 dir=$STATE/claude settings=$STATE/claude-settings-$KEY.json mcp=$STATE/claude-mcp.json; shift
+  mkdir -p "$dir"   # Claude Code's own config dir, never the user's: no OAuth login, user MCP, hooks or plugins
+  python3 - "$settings" "$mcp" "$URL" "$KEY" <<'PY'
+import json, sys
+settings, mcp, url, key = sys.argv[1:]
+# --settings outranks a repo's .claude/settings.json, so the base URL, the provider switches and the tokens pinned
+# here can't be redirected or replaced. No disableAllHooks: it turns the custom status line off too.
+json.dump({"env": {"ANTHROPIC_BASE_URL": url, "CLAUDE_CODE_USE_BEDROCK": "", "CLAUDE_CODE_USE_VERTEX": "",
+                   "CLAUDE_CODE_USE_FOUNDRY": "", "ANTHROPIC_AUTH_TOKEN": "local", "ANTHROPIC_API_KEY": "",
+                   "CLAUDE_CODE_OAUTH_TOKEN": "", "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
+                   "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1"},
+  "permissions": {"defaultMode": "default", "deny": ["WebSearch", "WebFetch", "Agent"]},   # default: auto mode's classifier would run on the local model
+  "autoUpdates": False, "includeGitInstructions": False, "skipWebFetchPreflight": True,
+  "enableArtifact": False, "disableClaudeAiConnectors": True, "autoMemoryEnabled": False, "promptSuggestionEnabled": False,
+  "statusLine": {"type": "command", "command": f"printf '\\033[7m JOCAL · {key} \\033[0m'"}},
+  open(settings, "w"), indent=1)
+PY
+  mcp_allowlist "$mcp"
+  # Every token variable is blanked: the dummy ANTHROPIC_AUTH_TOKEN is the only credential that reaches oMLX.
+  ENV=(CLAUDE_CONFIG_DIR="$dir" ANTHROPIC_BASE_URL="$URL" ANTHROPIC_AUTH_TOKEN=local ANTHROPIC_API_KEY=
+       CLAUDE_CODE_OAUTH_TOKEN= CLAUDE_CODE_USE_BEDROCK= CLAUDE_CODE_USE_VERTEX= CLAUDE_CODE_USE_FOUNDRY=
+       ANTHROPIC_MODEL="$model" ANTHROPIC_DEFAULT_OPUS_MODEL="$model" ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
+       ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" ANTHROPIC_DEFAULT_FABLE_MODEL="$model" CLAUDE_CODE_SUBAGENT_MODEL="$model"
+       CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CTX" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$MAX_OUT" MAX_THINKING_TOKENS=0
+       CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS="$READ_CAP" BASH_MAX_OUTPUT_LENGTH=15000
+       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_AUTOUPDATER=1
+       DISABLE_FEEDBACK_COMMAND=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
+       CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1 CLAUDE_CODE_DISABLE_ARTIFACT=1 CLAUDE_CODE_DISABLE_WEB_FETCH=1
+       CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 CLAUDE_CODE_ATTRIBUTION_HEADER=0 CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1
+       CLAUDE_CODE_AUTO_MODE_SERVER=0 CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+       CLAUDE_CODE_ENABLE_AWAY_SUMMARY=0 CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+       CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1 CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1)
+  # --strict-mcp-config: only the servers in the generated --mcp-config load, never the user's or a repo's .mcp.json.
+  # --tools doesn't hide MCP tools (2.1.302), so an allowed server's tools are declared without naming them here.
+  CMD=("$CLAUDE_BIN" --settings "$settings" --strict-mcp-config --mcp-config "$mcp" --tools "Read,Edit,Write,Bash${CLAUDE_EXTRA_TOOLS:+,$CLAUDE_EXTRA_TOOLS}")
+  [ ${#MCP_ALLOWED[@]} -gt 0 ] || CMD+=(--disallowedTools "mcp__*")
+  FILES=("$settings" "$mcp")
+  NOTES=("config dir: $dir (Claude Code's own, not ~/.claude)" "read cap: ~$READ_CAP tokens (CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS)"
+         "local instructions: not wired into Claude Code yet" "$MCP_NOTE")
+  # Claude Code prints an `unrecognized_model` line for a non-Claude model id, on stderr and only in print mode
+  # (-p, --print, or short flags combined with p in them, like -cp).
+  local a; for a in "$@"; do
+    if [[ $a == --print || $a =~ ^-[A-Za-z]*p[A-Za-z]*$ ]]; then STDERR_DROP='^\[claude-code:unrecognized_model\] '; fi
+  done
+}
+
+# Regenerates Pi's agent dir and sets NOTES, ENV, CMD and FILES for a session on $1 (an oMLX model id).
+pi_profile() {
+  local dir=$STATE/pi
+  mkdir -p "$dir"   # only jocal's own files are rewritten: Pi keeps its sessions here
+  python3 - "$dir" "$URL" "$CTX" "$MAX_OUT" "${IDS[@]}" <<'PY'
+import json, sys
+d, url, ctx, out, models = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5:]
+json.dump({"providers": {"local": {"baseUrl": url + "/v1", "api": "openai-completions", "apiKey": "local",
+  "models": [{"id": m, "reasoning": False, "input": ["text"], "contextWindow": ctx, "maxTokens": out,
+              "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}} for m in models]}}},
+  open(f"{d}/models.json", "w"), indent=1)
+json.dump({"enableInstallTelemetry": False, "quietStartup": True, "defaultProvider": "local",
+  "compaction": {"reserveTokens": out, "keepRecentTokens": 8000}}, open(f"{d}/settings.json", "w"), indent=1)
+PY
+  # Pi 1.3.0 never updates itself; its only update traffic is the version check, which PI_SKIP_VERSION_CHECK stops.
+  ENV=(PI_CODING_AGENT_DIR="$dir" PI_OFFLINE=1 PI_TELEMETRY=0 PI_SKIP_VERSION_CHECK=1)
+  # Pi declares an allowed server's tools only with direct exposure and its name in --tools (Pi's tool names have _ for -).
+  # A trusted project's .pi/mcp.json server would still connect, so with MCP on, --no-approve keeps the
+  # trust-gated project files out.
+  mcp_allowlist "$dir/mcp.json" '{"exposure": "direct"}'
+  local tools="read,edit,write,bash${PI_EXTRA_TOOLS:+,$PI_EXTRA_TOOLS}" name
+  for name in ${MCP_ALLOWED[@]+"${MCP_ALLOWED[@]}"}; do tools+=",mcp__${name//-/_}__*"; done
+  CMD=("$PI_BIN" --model "local/$1" --no-skills --no-prompt-templates --tools "$tools")
+  if [ ${#MCP_ALLOWED[@]} -eq 0 ]; then CMD+=(--no-mcp); else CMD+=(--no-approve); fi
+  FILES=("$dir/models.json" "$dir/settings.json" "$dir/mcp.json")
+  NOTES=("$MCP_NOTE")
+  pi_read_extension "$dir"
+  pi_local_instructions "$dir"
+  project_instructions
+  if [ ${#PROJECT_FILES[@]} -eq 0 ]; then NOTES+=("project instructions: none")
+  else NOTES+=("project instructions: ${PROJECT_FILES[*]} (~$PROJECT_TOKENS tokens)"); fi
+}
+
+# read.ts replaces Pi's built-in read (50 KB / 2,000 lines) with one capped at READ_CAP, which refuses a bigger
+# file and names the `jocal summarise` command instead.
+pi_read_extension() {
+  cp "$here/read.ts" "$1/read.ts"
+  ENV+=(JOCAL_READ_CAP_TOKENS="$READ_CAP")
+  CMD+=(--extension "$1/read.ts")
+  NOTES+=("read cap: ~$READ_CAP tokens ($(( READ_CAP * 4 )) chars), from $1/read.ts; a bigger file is refused and pointed at jocal summarise")
+}
+
+# LOCAL.md goes in as Pi's own append file, named on the command line too: Pi lets a trusted repo's
+# .pi/APPEND_SYSTEM.md replace the agent-dir one, but not the flag.
+pi_local_instructions() {
+  local file=$1/APPEND_SYSTEM.md n
+  rm -f "$file"
+  [ -n "$LOCAL_INSTRUCTIONS" ] || { NOTES+=("local instructions: off (LOCAL_INSTRUCTIONS is empty)"); return; }
+  n=$(tokens "$LOCAL_INSTRUCTIONS")
+  [ "$n" -le "$LOCAL_INSTRUCTIONS_MAX_TOKENS" ] ||
+    echo "jocal: warning: $LOCAL_INSTRUCTIONS is ~$n tokens, over LOCAL_INSTRUCTIONS_MAX_TOKENS=$LOCAL_INSTRUCTIONS_MAX_TOKENS; every turn pays for it" >&2
+  cp "$LOCAL_INSTRUCTIONS" "$file"
+  CMD+=(--append-system-prompt "$file")
+  FILES+=("$file")
+  NOTES+=("local instructions: $LOCAL_INSTRUCTIONS (~$n tokens)")
+}
+
+# `jocal status`: local mode at a glance. Warnings go to stdout too, each on a `warning:` line.
+status() {
+  if runtime_up; then
+    echo "runtime: up ($URL)"
+    curl -sf -m 2 --noproxy '*' "$URL/v1/models/status" | python3 -c '
+import json, sys
+loaded = [m["id"] for m in json.load(sys.stdin).get("models", []) if m.get("loaded")]
+print("loaded:", ", ".join(loaded) or "none")' || echo "loaded: unknown (no /v1/models/status)"
+  else echo "runtime: down ($URL)"; fi
+  local pid leases=()
+  for pid in $(live_leases); do leases+=("$pid ($(head -n 1 "$STATE/leases/$pid" 2>/dev/null))"); done
+  if [ ${#leases[@]} -eq 0 ]; then echo "leases: none"
+  else echo "leases: $(comma_list "${leases[@]}")"; fi
+  model_budget
+  binary_pins
+  model_pins
+  project_instructions
+  local warning
+  if warning=$(project_warning); then echo "warning: $warning (${PROJECT_FILES[*]})"; fi
+}
+
+comma_list() { printf '%s, ' "$@" | sed 's/, $//'; }
+
+UPGRADE_CHECK="run the upgrade check before moving a pin ($here/README.md, \"Upgrading\")"
+
+# Each binary's `--version` (its first word) against its pin.
+binary_pins() {
+  local name bin pin var version ok=()
+  for name in omlx pi claude; do
+    case $name in
+      omlx) bin=$OMLX_BIN var=PIN_OMLX pin=$PIN_OMLX ;;
+      pi) bin=$PI_BIN var=PIN_PI pin=$PIN_PI ;;
+      claude) bin=$CLAUDE_BIN var=PIN_CLAUDE pin=$PIN_CLAUDE ;;
+    esac
+    version=$("$bin" --version 2>/dev/null | awk 'NR == 1 {print $1}') || true
+    if [ "$version" = "$pin" ]; then ok+=("$name $version")
+    else echo "warning: $name is ${version:-not on PATH}, but $var=$pin; $UPGRADE_CHECK"; fi
+  done
+  [ ${#ok[@]} -eq 0 ] || echo "$(comma_list "${ok[@]}"): at their pins"
+}
+
+# Each model's PIN_MODELS entry (key=<hf repo>@<commit>) against the REVISION file `jocal fetch` writes in its folder.
+model_pins() {
+  local i key pin rev ok=()
+  for i in "${!KEYS[@]}"; do
+    key=${KEYS[i]} pin=$(model_pin "${KEYS[i]}")
+    rev=$(head -n 1 "$MODELS_DIR/${IDS[i]}/REVISION" 2>/dev/null) || rev=
+    if [ -z "$pin" ]; then echo "warning: model $key (${IDS[i]}) has no pin in PIN_MODELS; $UPGRADE_CHECK"
+    elif [ -z "$rev" ]; then echo "warning: model $key (${IDS[i]}) has no recorded revision (fetch it with jocal fetch --$key); PIN_MODELS has $key=$pin"
+    elif [ "$rev" != "$pin" ]; then echo "warning: model $key (${IDS[i]}) is $rev, but PIN_MODELS has $key=$pin; $UPGRADE_CHECK"
+    else ok+=("$key $rev"); fi
+  done
+  [ ${#ok[@]} -eq 0 ] || echo "$(comma_list "${ok[@]}"): at their pins"
+}
+
+# Installed models are the folders in MODELS_DIR; their size is the bytes in them (GB = 10^9 bytes).
+# A candidate under trial is allowed as one model over MAX_MODELS; DISK_CAP_GB stays hard.
+model_budget() {
+  local extra=0
+  if [ -n "$CANDIDATE" ]; then
+    local cand=${CANDIDATE%%:*} challenged=${CANDIDATE#*:}
+    echo "candidate under trial: $cand ($(model_id "$cand" || echo '?')) challenges $challenged ($(model_id "$challenged" || echo '?'))"
+    extra=1
+  fi
+  python3 - "$MODELS_DIR" "$DISK_CAP_GB" "$MAX_MODELS" "$extra" <<'PY'
+import os, sys
+from pathlib import Path
+models_dir, cap, max_models, extra = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+folders = sorted(d for d in models_dir.iterdir() if d.is_dir()) if models_dir.is_dir() else []
+size = sum(os.path.getsize(os.path.join(root, f)) for d in folders for root, _, files in os.walk(d) for f in files)
+limit = f"MAX_MODELS={max_models}" + (" + 1 candidate" if extra else "")
+print(f"models: {len(folders)} installed ({limit}), {size / 1e9:.1f} GB on disk (DISK_CAP_GB={cap})")
+if size > cap * 1e9:
+    print(f"warning: installed models use {size / 1e9:.1f} GB, over DISK_CAP_GB={cap}")
+if len(folders) > max_models + extra:
+    print(f"warning: {len(folders)} models installed, over {limit}")
+PY
+}
+
+# A model key's PIN_MODELS entry (<hf repo>@<commit>), or nothing.
+model_pin() {
+  local entry
+  set -f; for entry in $PIN_MODELS; do [ "${entry%%=*}" != "$1" ] || echo "${entry#*=}"; done; set +f
+}
+
+# `jocal fetch [--<key>]`: the model's PIN_MODELS commit into MODELS_DIR/<oMLX id>, with that pin in its REVISION.
+fetch() {
+  parse_args "$@"
+  [ ${#ARGS[@]} -eq 0 ] || { echo "jocal: fetch takes only a model key, like --9b" >&2; exit 2; }
+  local model pin dir; model=$(model_id "$KEY") pin=$(model_pin "$KEY") dir=$MODELS_DIR/$model
+  [[ $pin == ?*@?* ]] || { echo "jocal: model $KEY has no <hf repo>@<commit> in PIN_MODELS ($CONFIG)" >&2; exit 2; }
+  command -v "$HF_BIN" >/dev/null || {
+    echo "jocal: the hf CLI is missing; install it with: uv tool install huggingface_hub" >&2; exit 1; }
+  echo "jocal: fetching ${pin%@*} at ${pin##*@} into $dir" >&2
+  HF_HUB_DISABLE_TELEMETRY=1 "$HF_BIN" download "${pin%@*}" --revision "${pin##*@}" --local-dir "$dir"
+  rm -rf "$dir/.cache"
+  echo "$pin" >"$dir/REVISION"
+}
+
+# `jocal doctor`: one line per need, `ok:`, `missing:` (a first session can't start; exit 1) or `optional:`, each
+# missing one with the command that installs it. It starts nothing.
+doctor() {
+  local failed=0 found i flag
+  check() {   # check <required|optional> <label> <hint> <found version or empty>
+    if [ -n "$4" ]; then echo "ok: $2 $4"
+    elif [ "$1" = required ]; then echo "missing: $2: $3"; failed=1
+    else echo "optional: $2: $3"; fi
+  }
+  version() { "$1" --version 2>/dev/null | awk 'NR == 1 {print $1}' || true; }
+  if [ "$(uname -sm)" = "Darwin arm64" ]; then echo "ok: macOS on Apple Silicon"
+  else echo "missing: macOS on Apple Silicon (oMLX needs it)"; failed=1; fi
+  check required oMLX "uv tool install --python 3.13 \"omlx @ https://github.com/jundot/omlx/releases/download/v$PIN_OMLX/omlx-$PIN_OMLX-cp313-cp313-macosx_15_0_universal2.whl\"" "$(version "$OMLX_BIN")"
+  check required Pi "npm install -g @earendil-works/pi-coding-agent@$PIN_PI" "$(version "$PI_BIN")"
+  for i in "${!KEYS[@]}"; do
+    found=; [ ! -e "$MODELS_DIR/${IDS[i]}/config.json" ] || found="in $MODELS_DIR"
+    flag=; [ "$i" -eq 0 ] || flag=" --${KEYS[i]}"
+    check "$([ "$i" -eq 0 ] && echo required || echo optional)" "model ${KEYS[i]} (${IDS[i]})" "jocal fetch$flag" "$found"
+  done
+  check optional "Claude Code" "npm install -g @anthropic-ai/claude-code (for jocal claude)" "$(version "$CLAUDE_BIN")"
+  check optional "hf CLI" "uv tool install huggingface_hub (for jocal fetch)" "$(command -v "$HF_BIN" >/dev/null && echo found)"
+  check optional pdftotext "brew install poppler (for PDFs in jocal summarise)" "$(command -v pdftotext >/dev/null && echo found)"
+  return "$failed"
+}
+
+cmd=${1:-}; shift || true
+live_leases >/dev/null
+case $cmd in
+  pi|claude) session "$cmd" "$@" ;;
+  summarise) summarise "$@" ;;
+  up) up ;;
+  down) down "$@" ;;
+  status) status ;;
+  doctor) doctor ;;
+  fetch) fetch "$@" ;;
+  *) sed -n 2,10p "$0"; exit 2 ;;
+esac
