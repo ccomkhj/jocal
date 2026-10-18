@@ -54,9 +54,13 @@ class JocalTest(unittest.TestCase):
         if self.server:
             self.server.kill()
             self.server.wait()
-        for proc in self.sessions:
-            proc.kill()
-            proc.wait()
+        for proc in self.sessions:   # released, not killed: a killed jocal leaves its harness running (README)
+            proc.release.touch()
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
         pid = self.omlx_pid()
         if pid:
             try:
