@@ -43,6 +43,7 @@ Add `--explain` to `jocal pi` or `jocal claude` to print every env var, flag and
 - **Keeps the cloud out.** Pi gets its own agent dir (`~/.jocal/pi`), `--no-skills`, `--no-prompt-templates`, no MCP, offline and telemetry off. Claude Code gets its own config dir, a dummy token, a pinned base URL that a repo's `.claude/settings.json` can't override, and no MCP servers.
 - **Marks the session.** A banner and the terminal title say `JOCAL`, the model, and "prompts stay on this Mac".
 - **Reads whole files, or refuses.** Pi's `read` is replaced by one that returns a file whole up to a cap sized to the window (~20K tokens at 32K) and refuses a bigger file with the exact `jocal summarise` command, instead of silently truncating.
+- **Searches the web, if you turn it on.** With `WEB_SEARCH=duckduckgo`, Pi gets a `web_search` tool that returns the titles, links and snippets of the top results. The queries go to DuckDuckGo, and the banner says so (`prompts stay on this Mac, except web searches (html.duckduckgo.com)`). It is off by default; `WEB_SEARCH=duckduckgo jocal pi` turns it on for one session.
 - **Small instructions.** The project's instruction files load as usual (`AGENTS.md`/`CLAUDE.md` in Pi, `AGENTS.md` in Claude Code), with a warning in the banner and in `jocal status` when they're over ~1K tokens, since each 1K adds 3–5 s to a cold first reply. Pi also gets one short `~/.config/jocal/LOCAL.md` you own.
 
 Measured on a 16 GB M4 with the 4B and a 32K window: first replies in 4–6 s in Pi, ~28 tok/s, 6.3 GB peak, and 0 outbound connections with the network cut.
@@ -53,6 +54,7 @@ The first run writes `~/.config/jocal/jocal.conf` (from [`jocal.conf`](jocal.con
 
 - `PI_EXTRA_TOOLS`, `CLAUDE_EXTRA_TOOLS`: tools beyond read, edit, write and bash.
 - `MCP_SERVERS`: names from `MCP_FILE` (Claude Code's `mcpServers` format). Only stdio servers and `localhost` URLs are accepted; anything else stops the session before it starts.
+- `WEB_SEARCH`: empty (off) or `duckduckgo`, which gives Pi the `web_search` tool. Not wired into Claude Code yet.
 - `PI_BIN`, `OMLX_BIN`, `CLAUDE_BIN`, `HF_BIN`: binaries not on your PATH.
 
 To use another model, add `<key>=<folder name>` to `MODELS` (the key needs a digit, like `14b`) and `<key>=<hf repo>@<commit>` to `PIN_MODELS`, then `jocal fetch --14b` and `jocal pi --14b`.
@@ -65,6 +67,8 @@ To use another model, add `<key>=<folder name>` to `MODELS` (the key needs a dig
 sandbox-exec -f netcut.sb jocal pi -p "list the files here"    # works
 sandbox-exec -f netcut.sb curl -sI https://example.com         # fails: the network is cut
 ```
+
+With `WEB_SEARCH` on, `web_search` fails under it too, and tells the model it could not reach the search engine.
 
 ## Upgrading
 

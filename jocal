@@ -14,6 +14,7 @@ here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 CONFIG=${JOCAL_CONFIG:-$HOME/.config/jocal/jocal.conf}
 STATE=${JOCAL_STATE:-$HOME/.jocal}
 env_pi_bin=${PI_BIN:-} env_omlx_bin=${OMLX_BIN:-} env_claude_bin=${CLAUDE_BIN:-} env_hf_bin=${HF_BIN:-}   # an env override beats the config
+env_web_search=${WEB_SEARCH-} env_web_search_set=${WEB_SEARCH+1}   # so does WEB_SEARCH, even empty: on or off for one session
 if [ ! -e "$CONFIG" ]; then
   mkdir -p "$(dirname "$CONFIG")" && cp "$here/jocal.conf" "$CONFIG"
   echo "jocal: wrote a starter config to $CONFIG" >&2
@@ -26,6 +27,7 @@ if [ -n "$LOCAL_INSTRUCTIONS" ] && [ ! -e "$LOCAL_INSTRUCTIONS" ]; then
   mkdir -p "$(dirname "$LOCAL_INSTRUCTIONS")" && cp "$here/LOCAL.md" "$LOCAL_INSTRUCTIONS"
   echo "jocal: wrote starter local instructions to $LOCAL_INSTRUCTIONS" >&2
 fi
+[ -z "$env_web_search_set" ] || WEB_SEARCH=$env_web_search
 URL=http://127.0.0.1:$PORT
 PI_BIN=${env_pi_bin:-${PI_BIN:-pi}}
 OMLX_BIN=${env_omlx_bin:-${OMLX_BIN:-omlx}}
@@ -76,7 +78,7 @@ session() {
   parse_args "$@"; set -- ${ARGS[@]+"${ARGS[@]}"}
   profile "$harness" "$KEY" "$@"
   local model banner; model=$(model_id "$KEY")
-  banner="JOCAL · $harness · $KEY ($model) · oMLX $URL · prompts stay on this Mac${PLAN_WARNING:+ · $PLAN_WARNING}"
+  banner="JOCAL · $harness · $KEY ($model) · oMLX $URL · prompts stay on this Mac${PLAN_OUTBOUND:+, except $PLAN_OUTBOUND}${PLAN_WARNING:+ · $PLAN_WARNING}"
   [ -z "$EXPLAIN" ] || { echo "$banner"; echo; explain "$@"; return; }
   printf '\e[7m %s \e[0m\n' "$banner" >&2   # stderr, so `-p` output on stdout stays clean
   local opts=(--title "JOCAL · $harness · $KEY")
@@ -314,12 +316,13 @@ project_warning_line() {
 #   PLAN_FILES        the files generated for it           PLAN_NOTES  lines for --explain
 #   PLAN_STDERR_DROP  a grep pattern for its stderr lines to drop, or empty
 #   PLAN_WARNING      the banner's cold-reply warning for the project instructions it loads, or empty
+#   PLAN_OUTBOUND     what the session sends off this Mac, for the banner (`web searches (<host>)`), or empty
 # Each adapter owns its own instruction discovery; the helpers below it are its implementation.
 # ---------------------------------------------------------------------------------------------------------------
 
 profile() {
   local harness=$1 key=$2; shift 2
-  PLAN_ENV=() PLAN_CMD=() PLAN_FILES=() PLAN_NOTES=() PLAN_STDERR_DROP='' PLAN_WARNING=''
+  PLAN_ENV=() PLAN_CMD=() PLAN_FILES=() PLAN_NOTES=() PLAN_STDERR_DROP='' PLAN_WARNING='' PLAN_OUTBOUND=''
   "${harness}_profile" "$key" "$(model_id "$key")" "$@"
 }
 
@@ -425,6 +428,7 @@ PY
   PLAN_FILES=("$settings")
   PLAN_NOTES=("config dir: $dir (Claude Code's own, not ~/.claude)" "read cap: ~$READ_CAP tokens (CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS)"
               "local instructions: not wired into Claude Code yet")
+  [ -z "$WEB_SEARCH" ] || PLAN_NOTES+=("web search: not wired into Claude Code yet (WEB_SEARCH=$WEB_SEARCH is for jocal pi)")
   mcp_allowlist "$mcp"
   # --strict-mcp-config: only the servers in the generated --mcp-config load, never the user's or a repo's .mcp.json.
   # --tools doesn't hide MCP tools (2.1.302), so an allowed server's tools are declared without naming them here.
@@ -461,11 +465,12 @@ PY
   # A trusted project's .pi/mcp.json server would still connect, so with MCP on, --no-approve keeps the
   # trust-gated project files out.
   mcp_allowlist "$dir/mcp.json" '{"exposure": "direct"}'
-  local tools="read,edit,write,bash${PI_EXTRA_TOOLS:+,$PI_EXTRA_TOOLS}" name
+  local tools="read,edit,write,bash${PI_EXTRA_TOOLS:+,$PI_EXTRA_TOOLS}${WEB_SEARCH:+,web_search}" name
   for name in ${MCP_ALLOWED[@]+"${MCP_ALLOWED[@]}"}; do tools+=",mcp__${name//-/_}__*"; done
   PLAN_CMD=("$PI_BIN" --model "local/$model" --no-skills --no-prompt-templates --tools "$tools")
   if [ ${#MCP_ALLOWED[@]} -eq 0 ]; then PLAN_CMD+=(--no-mcp); else PLAN_CMD+=(--no-approve); fi
   pi_read_extension "$dir"
+  pi_web_search_extension "$dir"
   pi_local_instructions "$dir"
   plan_project_instructions "${PI_PROJECT_NAMES[@]}"
 }
@@ -477,6 +482,23 @@ pi_read_extension() {
   PLAN_ENV+=(JOCAL_READ_CAP_TOKENS="$READ_CAP")
   PLAN_CMD+=(--extension "$1/read.ts")
   PLAN_NOTES+=("read cap: ~$READ_CAP tokens ($(( READ_CAP * 4 )) chars), from $1/read.ts; a bigger file is refused and pointed at jocal summarise")
+}
+
+# web_search.ts gives Pi a `web_search` tool when WEB_SEARCH names a search engine: the queries go to it, and are
+# the only thing the session sends off this Mac. An engine jocal doesn't know ends jocal before anything starts.
+pi_web_search_extension() {
+  local url
+  if [ -z "$WEB_SEARCH" ]; then rm -f "$1/web_search.ts"; PLAN_NOTES+=("web search: off (WEB_SEARCH is empty)"); return; fi
+  case $WEB_SEARCH in
+    duckduckgo) url=https://html.duckduckgo.com/html/ ;;   # the only results page web_search.ts reads
+    *) echo "jocal: WEB_SEARCH=$WEB_SEARCH is not a search engine jocal knows (duckduckgo, or empty for none); no session started" >&2
+       exit 2 ;;
+  esac
+  place_file "$here/web_search.ts" "$1/web_search.ts"
+  PLAN_ENV+=(JOCAL_WEB_SEARCH_URL="$url")
+  PLAN_CMD+=(--extension "$1/web_search.ts")
+  url=${url#*://}; PLAN_OUTBOUND="web searches (${url%%/*})"
+  PLAN_NOTES+=("web search: $WEB_SEARCH, from $1/web_search.ts; the queries leave this Mac for ${url%%/*}")
 }
 
 # LOCAL.md goes in as Pi's own append file, named on the command line too: Pi lets a trusted repo's

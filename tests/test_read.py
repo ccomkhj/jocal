@@ -1,5 +1,5 @@
 """The Pi read extension (`read.ts`), through Pi's extension interface: its default export registers a `read`
-tool, run here by `read_tool.mjs` on fixture files below, at and above the cap.
+tool, run here by `pi_tool.mjs` on fixture files below, at and above the cap.
 
 The cap is JOCAL_READ_CAP_TOKENS, estimated as chars/4; these tests use 100 tokens, so 400 chars.
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 EXTENSION = REPO / "read.ts"
-DRIVER = Path(__file__).resolve().parent / "read_tool.mjs"
+DRIVER = Path(__file__).resolve().parent / "pi_tool.mjs"
 NODE = shutil.which("node")
 
 
@@ -34,7 +34,7 @@ class ReadExtension(unittest.TestCase):
     def read(self, cap=100, **params):
         """Runs the read tool with JOCAL_READ_CAP_TOKENS=cap (unset when cap is None)."""
         env = {} if cap is None else {"JOCAL_READ_CAP_TOKENS": str(cap)}
-        r = subprocess.run([NODE, str(DRIVER), EXTENSION.as_uri(), str(self.dir), json.dumps(params)],
+        r = subprocess.run([NODE, str(DRIVER), EXTENSION.as_uri(), "read", str(self.dir), json.dumps(params)],
                            env=env, capture_output=True, text=True, timeout=20)
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout)
