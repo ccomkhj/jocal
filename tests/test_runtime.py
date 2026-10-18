@@ -51,6 +51,24 @@ class Up(JocalTest):
             self.assertNotIn("Terminated", r.stderr)
             self.assertNotIn("Killed", r.stderr)
 
+    def test_a_runtime_started_by_hand_outlives_the_last_session_until_down(self):
+        self.jocal("up")
+        self.end_session(self.start_session())
+        self.assertTrue(self.runtime_answers())
+        self.assertEqual(len(self.omlx_calls()), 1)
+        self.assertIn("held: by jocal up", self.jocal("status").stdout)
+        self.assertEqual(self.jocal("down").returncode, 0)
+        self.assertFalse(self.runtime_answers())
+
+    def test_up_claims_a_runtime_a_session_started(self):
+        session = self.start_session()
+        self.assertEqual(self.jocal("up").returncode, 0)
+        self.end_session(session)
+        self.assertTrue(self.runtime_answers())
+        self.jocal("down")
+        self.end_session(self.start_session())   # a fresh on-demand start is not held
+        self.assertFalse(self.runtime_answers())
+
     def test_two_ups_at_once_start_one_runtime(self):
         procs = [subprocess.Popen([str(JOCAL), "up"], env=self.env | {"FAKE_OMLX_DELAY": "1"},
                                   stdin=subprocess.DEVNULL, stderr=subprocess.PIPE) for _ in range(2)]

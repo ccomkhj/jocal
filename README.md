@@ -32,18 +32,18 @@ jocal claude [--9b] [claude args]      Claude Code on the local model (experimen
 jocal summarise <file> "<question>"    answer a question about a long document or PDF (map-reduce)
 jocal status                           runtime, loaded models, sessions, disk budget, version drift
 jocal doctor | fetch [--9b]            check the setup / download a model
-jocal up | down [--force]              start or stop oMLX by hand
+jocal up | down [--force]              start oMLX by hand and hold it up until `down` / stop it
 ```
 
 Add `--explain` to `jocal pi` or `jocal claude` to print every env var, flag and generated file the session would use, without starting anything. Arguments after the jocal ones go to the harness unchanged (`jocal pi -p "hi"`).
 
 ## What it does
 
-- **Starts and stops the model for you.** oMLX starts when a session needs it and stops when the last session exits (`STOP_RUNTIME=manual` keeps it up). A 4B and a 9B session share one oMLX.
+- **Starts and stops the model for you.** oMLX starts when a session needs it and stops when the last session exits (`STOP_RUNTIME=manual` keeps it up). An oMLX started or claimed with `jocal up` is held: sessions leave it running, and only `jocal down` stops it. A 4B and a 9B session share one oMLX.
 - **Keeps the cloud out.** Pi gets its own agent dir (`~/.jocal/pi`), `--no-skills`, `--no-prompt-templates`, no MCP, offline and telemetry off. Claude Code gets its own config dir, a dummy token, a pinned base URL that a repo's `.claude/settings.json` can't override, and no MCP servers.
 - **Marks the session.** A banner and the terminal title say `JOCAL`, the model, and "prompts stay on this Mac".
 - **Reads whole files, or refuses.** Pi's `read` is replaced by one that returns a file whole up to a cap sized to the window (~20K tokens at 32K) and refuses a bigger file with the exact `jocal summarise` command, instead of silently truncating.
-- **Small instructions.** The project's `AGENTS.md`/`CLAUDE.md` loads as usual (with a warning when it's over ~1K tokens, since each 1K adds 3–5 s to a cold first reply), plus one short `~/.config/jocal/LOCAL.md` you own.
+- **Small instructions.** The project's instruction files load as usual (`AGENTS.md`/`CLAUDE.md` in Pi, `AGENTS.md` in Claude Code), with a warning in the banner and in `jocal status` when they're over ~1K tokens, since each 1K adds 3–5 s to a cold first reply. Pi also gets one short `~/.config/jocal/LOCAL.md` you own.
 
 Measured on a 16 GB M4 with the 4B and a 32K window: first replies in 4–6 s in Pi, ~28 tok/s, 6.3 GB peak, and 0 outbound connections with the network cut.
 

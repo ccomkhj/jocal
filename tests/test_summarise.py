@@ -154,6 +154,11 @@ class Lifecycle(JocalTest):
         self.jocal("summarise", str(self.doc), QUESTION)
         self.assertTrue(self.runtime_answers())
 
+    def test_neither_sets_nor_clears_the_terminal_title(self):
+        r = self.jocal("summarise", str(self.doc), QUESTION)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("\x1b]0;", r.stderr)
+
     def test_it_leaves_a_live_sessions_runtime_running(self):
         session = self.start_session()
         self.jocal("summarise", str(self.doc), QUESTION)

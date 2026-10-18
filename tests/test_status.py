@@ -160,6 +160,16 @@ class Instructions(StatusTest):
         r = self.jocal("status")
         self.assertEqual([w for w in self.warnings(r) if "AGENTS.md" in w], [])
 
+    def test_a_file_only_pi_loads_is_flagged_once_and_one_both_load_is_flagged_once(self):
+        (self.project / "CLAUDE.md").write_text("x" * 6000)   # Pi loads it; Claude Code looks only for AGENTS.md
+        r = self.jocal("status")
+        self.assertEqual(len([w for w in self.warnings(r) if "tokens" in w]), 1)
+        self.assertIn("warning: CLAUDE.md is ~1500 tokens", r.stdout)
+        (self.project / "CLAUDE.md").unlink()
+        (self.project / "AGENTS.md").write_text("x" * 6000)   # both load it: one line, not two
+        r = self.jocal("status")
+        self.assertEqual(len([w for w in self.warnings(r) if "tokens" in w]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

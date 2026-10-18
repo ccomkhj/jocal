@@ -1,1 +1,9 @@
 __pycache__/
+
+# agent-workflow files, kept local
+AGENTS.md
+CLAUDE.md
+GLOSSARY.md
+docs/adr/
+tickets/
+.claude/

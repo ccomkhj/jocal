@@ -95,6 +95,23 @@ class ClaudeSession(JocalTest):
         self.assertIn("\x1b]0;JOCAL · claude · 9b\x07", r.stderr)
         self.assertTrue(r.stderr.endswith("\x1b]0;\x07"), repr(r.stderr[-20:]))
 
+    def banner(self, r):
+        return next(line for line in r.stderr.splitlines() if "\x1b[7m JOCAL" in line)
+
+    def test_an_agents_md_over_1k_tokens_warns_in_the_banner(self):
+        (self.project / "AGENTS.md").write_text("x" * 4400)
+        r = self.jocal("claude")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("AGENTS.md is ~1100 tokens; each 1K adds 3-5 s to a cold first reply", self.banner(r))
+        self.assertIn(f"project instructions: {self.project}/AGENTS.md (~1100 tokens)",
+                      self.jocal("claude", "--explain").stdout)
+
+    def test_only_agents_md_counts_for_claude_code(self):
+        (self.project / "CLAUDE.md").write_text("x" * 4400)
+        r = self.jocal("claude")
+        self.assertNotIn("tokens", self.banner(r))
+        self.assertIn("project instructions: none", self.jocal("claude", "--explain").stdout)
+
     def test_print_mode_drops_the_unrecognized_model_line_and_keeps_the_rest(self):
         r = self.jocal("claude", "-p", "hi", FAKE_CLAUDE_STDERR="a real error")
         self.assertEqual(r.returncode, 0, r.stderr)
